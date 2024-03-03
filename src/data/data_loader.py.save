@@ -1,0 +1,199 @@
+import pandas as pd
+import os
+import re
+import statistics
+from sklearn.metrics import confusion_matrix
+from sklearn.metrics import accuracy_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+sns.set_theme()
+
+from definitions import MODEL_DIR, DATA_DIR
+
+def combine_labels_and_pseudolabels(df, datasets):
+    dataset_tuples = [(f"{dataset}_label", f"{dataset}_pseudolabels") for dataset in datasets]
+
+    for i, dataset in enumerate(datasets):
+        df[dataset] = df[dataset_tuples[i][0]].astype(str).replace("nan", '') +  df[dataset_tuples[i][1]].astype(str).replace("nan", '')
+    return df
+
+def _load_data_csv(csv_path, text_column_name, label_column_name, label_mapping={}, seperator=",", header=0):
+    df = pd.read_csv(csv_path, index_col=False, sep=seperator, header=header)
+
+    if (text_column_name not in df.columns or label_column_name not in df.columns):
+        raise ValueError(f"Columns {[text_column_name, label_column_name]} do not exist in csv file columns {df.columns}")
+
+    df = df.rename({text_column_name: "text", label_column_name: "label"}, axis=1)
+    if label_mapping:
+         df = df.replace({"label": label_mapping})
+    print(f"Loaded {csv_path}")
+    return df[["text", "label"]]
+
+
+def load_original_data(dataset):
+    if dataset == "davidson":
+        davidson_path = os.path.join(DATA_DIR, "davidson/labeled_data.csv")
+        davidson_df = _load_data_csv(davidson_path,
+                       text_column_name="tweet",
+                       label_column_name="class",
+                       label_mapping={0: "hate_speech", 1: "offensive", 2: "neither"})
+        return davidson_df
+
+    elif dataset == "founta":
+        founta_path = os.path.join(DATA_DIR, "founta/hatespeech_text_label_vote.csv")
+        founta_df = _load_data_csv(founta_path,
+                       text_column_name=0,
+                       label_column_name=1,
+                       seperator= "\t",
+                       header=None)
+        founta_df = founta_df[founta_df["label"] != "spam"]
+        return founta_df
+
+    elif dataset == "olid":
+        olid_path = os.path.join(DATA_DIR, "olid/olid-training-v1.0.tsv")
+        olid_df = _load_data_csv(olid_path,
+                       text_column_name="tweet",
+                       label_column_name="subtask_a",
+                       label_mapping={"OFF": "offensive", "NOT": "normal"},
+                       seperator="\t")
+        return olid_df
+    else:
+        raise ValueError(f"Dataset {dataset} is not available.")
+
+
+def load_preprocessed_data(dataset, train=True, add_dataset_name=False):
+    path_mapping = {'davidson': "davidson/davidson_renamed_{0}.csv",
+                    'founta': "founta/founta_renamed_{0}.csv",
+                    'olid': "olid/olid_renamed_{0}.csv",
+                    'davidson-founta': "concats/davidson_founta_train.csv",
+                    'davidson-olid': "concats/davidson_olid_train.csv",
+                    'founta-olid': "concats/founta_olid_train.csv",
+                    'davidson-founta-olid': "concats/davidson_founta_olid_train.csv"}
+
+    if "-" not in dataset:
+        if train:
+            selected_path = path_mapping[dataset].format("train")
+        else:
+            selected_path = path_mapping[dataset].format("test")
+    else:
+        selected_path = path_mapping[dataset]
+
+    csv_path = os.path.join(DATA_DIR, selected_path)
+    data = _load_data_csv(csv_path, text_column_name="text", label_column_name="label")
+    if add_dataset_name:
+        data = data.rename(columns={"label": f"{dataset}_label"})
+    return data
+
+def preprocess(text):
+    #print(text)
+    text = text.replace("NEWLINE_TOKEN"," ")
+    text = text.replace("TAB_TOKEN"," ")
+    text = text.replace("RT"," ")
+
+    text = re.sub("@\w{1,15}", ' ', text)
+    # remove URLS
+    #print("before url")
+    text = re.sub("http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+", ' ', text)
+    # remove HTML tags
+    #print("before html tags")
+    text = re.sub("([a-z]+=``.+``)+", ' ', text)
+    #print("before html tags")
+    text = re.sub("[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+", ' ', text)
+    #remove mails
+    #print("before mails")
+    text = re.sub("([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)", '  ', text)
+    #remove images
+    #print("before images")
+    text = re.sub("Image:([a-zA-Z0-9\s?\,?\-?]+)\.(jpg|jpeg|JPG|png|gif)", ' ', text)
+    text = re.sub("File:([a-zA-Z0-9\s?\,?\-?]+)\.(jpg|jpeg|JPG|png|gif)", ' ', text)
+
+    #print("before date")
+    text = re.sub("\d{1,2}\s+(Jan(uary)?|Feb(ruary)?|Mar(ch)?|Apr(il)?|May|Jun(e)?|Jul(y)?|Aug(ust)?|Sep(tember)?|Oct(ober)?|Nov(ember)?|Dec(ember)?)\s+\d{4}\s+\d{1,2}:\d{1,2}", ' ', text)
+    text = re.sub("\d{1,2}\s+(Jan(uary)?|Feb(ruary)?|Mar(ch)?|Apr(il)?|May|Jun(e)?|Jul(y)?|Aug(ust)?|Sep(tember)?|Oct(ober)?|Nov(ember)?|Dec(ember)?)\s+\d{4}", '  ', text)
+    text = re.sub("\d{1,2}:\d{1,2}", ' ', text)
+    text = re.sub("\d{1,4}", ' ', text)
+
+    #print("before smiley")
+    #text = text.replace(":-)"," <smile> ")
+    #text = text.replace(":-("," <sad> ")
+    emoji_pattern = re.compile("["
+                           u"\U0001F600-\U0001F64F"  # emoticons
+                           u"\U0001F300-\U0001F5FF"  # symbols & pictographs
+                           u"\U0001F680-\U0001F6FF"  # transport & map symbols
+                           u"\U0001F1E0-\U0001F1FF"  # flags (iOS)
+                           u"\U00002702-\U000027B0"
+                           u"\U000024C2-\U0001F251"
+                           "]+", flags=re.UNICODE)
+    text = emoji_pattern.sub(r'', text)
+    #print("before UTC")
+    text = text.replace("(UTC)"," ")
+    text = text.replace(":"," ")
+    text = text.replace("="," ")
+    text = text.replace("<3","  ")
+    text = text.replace("e.g.","eg")
+    text = text.replace("i.e.","ie")
+    text = text.replace("'s"," is")
+    text = text.replace("´s"," is")
+    text = text.replace("'re"," are")
+    text = text.replace("n't"," not")
+    text = text.replace("'ve"," have")
+    text = text.replace("``","")
+    text = text.replace("`","")
+
+    #rermove_repeating_chars(text):
+    to_remove = ".,?!"
+    text = re.sub("(?P<char>[" + re.escape(to_remove) + "])(?P=char)+", r"\1", text)
+
+    text =  " ".join([a for a in re.split('([A-Z][a-z]+)', text) if a])
+
+    #print("before mapping")
+    mapping = [ ('!', ' '),('?', ' '),('|', ' '),('~', ' '),("'", ' '),('/', ' '),('(', ' '),(')', ' '),('[', ' '),(']', ' '),('—',' '),('-',' '),(',',' '),(':',' '),('→',' '),('*',' '),(';',' '),('.',' '),('•', ' '),('^', ' '),('_', ' '),('{', ' '),('}', ' '),('♥', ' '),('#', ' '),('&', ' '),('\xa0',' '),('%',' '),('←',' ')]
+    for k, v in mapping:
+        text = text.replace(k, v)
+
+    text = re.sub(' +', ' ', text)
+    text = text.strip()
+    text = text.lower()
+    # text = remove_stopwords(text.split(" "))
+
+    return text
+
+
+class CovidDataset():
+
+    def get_data(self, format="long", binary=False):
+        data_path = os.path.join(DATA_DIR, "covid", "export_voting.csv")
+        annot = pd.read_csv(data_path)
+        columns_to_ignore = ["DATASET", "userid"]
+        annot_columns = [col for col in annot.columns if col not in columns_to_ignore]
+        annot_columns = sorted(annot_columns, reverse=True)
+        annot = annot[annot_columns]
+
+        annot_long = annot.melt(id_vars=["id", "text"], var_name="annotator", value_name="label").dropna().sort_values("id")
+        annot_long = annot_long.replace({"label": {0: "NEITHER", 1: "HATE", 2: "OFFENSIVE", 3: "PROFANITY"}})
+
+        if binary:
+            label_mapping={"NEITHER": "NEG", "HATE": "POS", "OFFENSIVE": "POS", "PROFANITY": "POS"}
+            annot_long = annot_long.replace({"label": label_mapping})
+
+        if format == "long":
+            return annot_long
+        elif format == "wide":
+            annot_wide = annot_long.pivot(index=['id', "text"], columns='annotator', values='label').reset_index("text")
+            return annot_wide
+        else:
+            print(f"Format {format} is not available. Must be 'long' or 'wide'. ")
+
+class RedditDataset():
+    def get_data(self, expert_only=False, format="long", binary=False):
+        data_path = os.path.join(DATA_DIR, "reddit", "raw_data.csv")
+        annot = pd.read_csv(data_path)
+        columns_to_ignore = ["link_id", "parent_id", "score", "subreddit", "author", "slur", "disagreement"]
+        annot_columns = [col for col in annot.columns if col not in columns_to_ignore]
+        annot = annot[annot_columns]
+        annot = annot.rename(columns={"body": "text"})
+
+        # Drop rows with wrong formated text
+        annot = annot.drop(index=[5734, 22334, 31816])
+

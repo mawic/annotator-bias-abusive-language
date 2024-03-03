@@ -1,0 +1,736 @@
+import pandas as pd
+import os
+import re
+import statistics
+from sklearn.metrics import confusion_matrix
+from sklearn.metrics import accuracy_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+sns.set_theme()
+
+from definitions import MODEL_DIR, DATA_DIR
+
+def combine_labels_and_pseudolabels(df, datasets):
+    dataset_tuples = [(f"{dataset}_label", f"{dataset}_pseudolabels") for dataset in datasets]
+
+    for i, dataset in enumerate(datasets):
+        df[dataset] = df[dataset_tuples[i][0]].astype(str).replace("nan", '') +  df[dataset_tuples[i][1]].astype(str).replace("nan", '')
+    return df
+
+def _load_data_csv(csv_path, text_column_name, label_column_name, label_mapping={}, seperator=",", header=0):
+    df = pd.read_csv(csv_path, index_col=False, sep=seperator, header=header)
+
+    if (text_column_name not in df.columns or label_column_name not in df.columns):
+        raise ValueError(f"Columns {[text_column_name, label_column_name]} do not exist in csv file columns {df.columns}")
+
+    df = df.rename({text_column_name: "text", label_column_name: "label"}, axis=1)
+    if label_mapping:
+         df = df.replace({"label": label_mapping})
+    print(f"Loaded {csv_path}")
+    return df[["text", "label"]]
+
+
+def load_original_data(dataset):
+    if dataset == "davidson":
+        davidson_path = os.path.join(DATA_DIR, "davidson/labeled_data.csv")
+        davidson_df = _load_data_csv(davidson_path,
+                       text_column_name="tweet",
+                       label_column_name="class",
+                       label_mapping={0: "hate_speech", 1: "offensive", 2: "neither"})
+        return davidson_df
+
+    elif dataset == "founta":
+        founta_path = os.path.join(DATA_DIR, "founta/hatespeech_text_label_vote.csv")
+        founta_df = _load_data_csv(founta_path,
+                       text_column_name=0,
+                       label_column_name=1,
+                       seperator= "\t",
+                       header=None)
+        founta_df = founta_df[founta_df["label"] != "spam"]
+        return founta_df
+
+    elif dataset == "olid":
+        olid_path = os.path.join(DATA_DIR, "olid/olid-training-v1.0.tsv")
+        olid_df = _load_data_csv(olid_path,
+                       text_column_name="tweet",
+                       label_column_name="subtask_b",
+                       label_mapping={"UNT": "untargeted", np.nan: "not offensive", "TIN": "targeted"},
+                       seperator="\t")
+        return olid_df
+    else:
+        raise ValueError(f"Dataset {dataset} is not available.")
+
+
+def load_preprocessed_data(dataset, train=True, add_dataset_name=False):
+    path_mapping = {'davidson': "davidson/davidson_renamed_{0}.csv",
+                    'founta': "founta/founta_renamed_{0}.csv",
+                    'olid': "olid/olid_renamed_{0}.csv",
+                    'davidson-founta': "concats/davidson_founta_train.csv",
+                    'davidson-olid': "concats/davidson_olid_train.csv",
+                    'founta-olid': "concats/founta_olid_train.csv",
+                    'davidson-founta-olid': "concats/davidson_founta_olid_train.csv"}
+
+    if "-" not in dataset:
+        if train:
+            selected_path = path_mapping[dataset].format("train")
+        else:
+            selected_path = path_mapping[dataset].format("test")
+    else:
+        selected_path = path_mapping[dataset]
+
+    csv_path = os.path.join(DATA_DIR, selected_path)
+    data = _load_data_csv(csv_path, text_column_name="text", label_column_name="label")
+    if add_dataset_name:
+        data = data.rename(columns={"label": f"{dataset}_label"})
+    return data
+
+def remove_emoji(string):
+    # Taken from https://gist.github.com/slowkow/7a7f61f495e3dbb7e3d767f97bd7304b
+    emoji_pattern = re.compile("["
+                               u"\U0001F600-\U0001F64F"  # emoticons
+                               u"\U0001F300-\U0001F5FF"  # symbols & pictographs
+                               u"\U0001F680-\U0001F6FF"  # transport & map symbols
+                               u"\U0001F1E0-\U0001F1FF"  # flags (iOS)
+                               u"\U00002500-\U00002BEF"  # chinese char
+                               u"\U00002702-\U000027B0"
+                               u"\U00002702-\U000027B0"
+                               u"\U000024C2-\U0001F251"
+                               u"\U0001f926-\U0001f937"
+                               u"\U00010000-\U0010ffff"
+                               u"\u2640-\u2642"
+                               u"\u2600-\u2B55"
+                               u"\u200d"
+                               u"\u23cf"
+                               u"\u23e9"
+                               u"\u231a"
+                               u"\ufe0f"  # dingbats
+                               u"\u3030"
+                               "]+", flags=re.UNICODE)
+    return emoji_pattern.sub(r'', string)
+
+def camel_case_split(hastag):
+    # Taken from https://stackoverflow.com/questions/12597370/python-replace-string-pattern-with-output-of-function
+    hashtag = hastag.group()
+    matches = re.finditer('.+?(?:(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|$)', hashtag)
+    return " ".join([m.group(0) for m in matches])
+
+def preprocess(text):
+    #print(text)
+    text = text.replace("NEWLINE_TOKEN"," ")
+    text = text.replace("TAB_TOKEN"," ")
+    text = text.replace("RT"," ")
+
+    # Removing emojis
+    text = remove_emoji(text)
+    # Remove html entities for emojies
+    text = re.sub("&#8217;s", " is", text)
+    text = re.sub("&#\w{1,6};", ' ', text)
+
+    # Remove Twitter user names @hjkhjkh
+    text = re.sub("@\w{1,15}", ' ', text)
+    text = re.sub(r"(?:^|\s)[＃#]{1}(\w+)", camel_case_split, text)
+
+    # remove URLS
+    #print("before url")
+    text = re.sub("URL",' <url> ', text)
+    text = re.sub("http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+", ' <url> ', text)
+    # remove HTML tags
+    #print("before html tags")
+    text = re.sub("([a-z]+=``.+``)+", ' ', text)
+    #print("before html tags")
+    text = re.sub("[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+", ' <ip> ', text)
+    #remove mails
+    #print("before mails")
+    text = re.sub("([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)", ' <mail> ', text)
+    #remove images
+    #print("before images")
+    text = re.sub("Image:([a-zA-Z0-9\s?\,?\-?]+)\.(jpg|jpeg|JPG|png|gif)", ' <image> ', text)
+    text = re.sub("File:([a-zA-Z0-9\s?\,?\-?]+)\.(jpg|jpeg|JPG|png|gif)", ' <image> ', text)
+
+    #print("before date")
+    text = re.sub("\d{1,2}\s+(Jan(uary)?|Feb(ruary)?|Mar(ch)?|Apr(il)?|May|Jun(e)?|Jul(y)?|Aug(ust)?|Sep(tember)?|Oct(ober)?|Nov(ember)?|Dec(ember)?)\s+\d{4}\s+\d{1,2}:\d{1,2}", ' <date> ', text)
+    text = re.sub("\d{1,2}\s+(Jan(uary)?|Feb(ruary)?|Mar(ch)?|Apr(il)?|May|Jun(e)?|Jul(y)?|Aug(ust)?|Sep(tember)?|Oct(ober)?|Nov(ember)?|Dec(ember)?)\s+\d{4}", ' <date> ', text)
+    text = re.sub("\d{1,2}:\d{1,2}", ' <date> ', text)
+    text = re.sub("\d{1,4}", ' <number> ', text)
+
+    #print("before smiley")
+    #text = text.replace(":-)"," <smile> ")
+    #text = text.replace(":-("," <sad> ")
+
+    #print("before UTC")
+    text = text.replace("\n"," ")
+    text = text.replace("(UTC)"," ")
+    text = text.replace(":"," ")
+    text = text.replace("="," ")
+    text = text.replace("<3"," <love> ")
+    text = text.replace("e.g.","eg")
+    text = text.replace("i.e.","ie")
+    text = text.replace("'m"," am")
+    text = text.replace("'s"," is")
+    text = text.replace("´s"," is")
+    text = text.replace("'re"," are")
+    text = text.replace("'nt"," not")
+    text = text.replace("'ve"," have")
+    text = text.replace("``","")
+    text = text.replace("`","")
+
+    #rermove_repeating_chars(text):
+    to_remove = ".,?!"
+    text = re.sub("(?P<char>[" + re.escape(to_remove) + "])(?P=char)+", r"\1", text)
+
+    #print("before mapping")
+    mapping = [ ('!', ' '),('?', ' '),('|', ' '),('~', ' '),("'", ' '),('/', ' '),('(', ' '),(')', ' '),('[', ' '),(']', ' '),('—',' '),('-',' '),(',',' '),(':',' '),('→',' '),('*',' '),(';',' '),('.',' '),('•', ' '),('^', ' '),('_', ' '),('{', ' '),('}', ' '),('♥', '<love>'),('#', ' '),('&', ' '),('\xa0',' '),('%',' '),('←',' ')]
+    for k, v in mapping:
+        text = text.replace(k, v)
+
+    text = re.sub(' +', ' ', text)
+    text = text.strip()
+    text = text.lower()
+    # text = remove_stopwords(text.split(" "))
+
+    return text
+
+class MisogynyDataset:
+    def get_data(self, format="wide", expert_only=False, binary=False):
+        if expert_only:
+            return self.get_expert_data()
+        if format == "wide":
+            return self.get_data_wide()
+        if format == "long":
+            return self.get_data_long()
+
+    def get_data_wide(self):
+        data_path = os.path.join(DATA_DIR, "misogyny", "original_labels.csv")
+        annot = pd.read_csv(data_path)
+        annot["annotator"] = annot.apply(
+            lambda x: "Ann" + str(x["annotator_id"]), axis=1
+        )
+        columns_to_keep = ["entry_id", "body", "annotator", "level_1"]
+        annot = annot[columns_to_keep]
+        annot = annot.drop_duplicates()
+        annot = annot.rename(columns={"body": "text", "entry_id": "id"})
+        annot = annot.pivot_table(
+            index=["id", "text"], columns="annotator", values="level_1", aggfunc="first"
+        ).reset_index()
+        annot = annot.drop([315])
+        return annot
+
+    def get_data_long(self):
+        data_path = os.path.join(DATA_DIR, "misogyny", "original_labels.csv")
+        annot = pd.read_csv(data_path)
+        annot["annotator"] = annot.apply(
+            lambda x: "Ann" + str(x["annotator_id"]), axis=1
+        )
+        columns_to_keep = ["entry_id", "body", "annotator", "level_1"]
+        annot = annot[columns_to_keep]
+        annot = annot.drop_duplicates()
+        annot = annot.rename(columns={"body": "text", "entry_id": "id", 'level_1':'label'})
+        annot = annot.drop([315])
+        return annot
+
+    def get_expert_data(self):
+        data_path = os.path.join(DATA_DIR, "misogyny", "final_labels.csv")
+        annot = pd.read_csv(data_path)
+        columns_to_keep = ["entry_id", "body", "level_1"]
+        annot = annot[columns_to_keep]
+        annot = annot.drop_duplicates()
+        annot = annot.rename(
+            columns={"body": "text", "entry_id": "id", "level_1": "label"}
+        )
+        annot = annot.drop([58,6106])
+        return annot    
+
+
+class CovidDataset():
+
+    def get_data(self, format="long", binary=False):
+        data_path = os.path.join(DATA_DIR, "covid", "export_voting.csv")
+        annot = pd.read_csv(data_path)
+        columns_to_ignore = ["DATASET", "userid"]
+        annot_columns = [col for col in annot.columns if col not in columns_to_ignore]
+        annot_columns = sorted(annot_columns, reverse=True)
+        annot = annot[annot_columns]
+
+        annot_long = annot.melt(id_vars=["id", "text"], var_name="annotator", value_name="label").dropna().sort_values("id")
+        annot_long = annot_long.replace({"label": {0: "NEITHER", 1: "HATE", 2: "OFFENSIVE", 3: "PROFANITY"}})
+
+        if binary:
+            label_mapping={"NEITHER": "NEG", "HATE": "POS", "OFFENSIVE": "POS", "PROFANITY": "POS"}
+            annot_long = annot_long.replace({"label": label_mapping})
+
+        if format == "long":
+            return annot_long
+        elif format == "wide":
+            annot_wide = annot_long.pivot(index=['id', "text"], columns='annotator', values='label').reset_index("text")
+            return annot_wide
+        else:
+            print(f"Format {format} is not available. Must be 'long' or 'wide'. ")
+
+class RedditDataset():
+    def get_data(self, expert_only=False, format="long", binary=False):
+        data_path = os.path.join(DATA_DIR, "reddit", "raw_data.csv")
+        annot = pd.read_csv(data_path, engine="python", error_bad_lines=False)
+        columns_to_ignore = ["link_id", "parent_id", "score", "subreddit", "author", "slur", "disagreement"]
+        annot_columns = [col for col in annot.columns if col not in columns_to_ignore]
+        annot = annot[annot_columns]
+        annot = annot.rename(columns={"body": "text"})
+
+        # Drop rows with wrong formated text
+        annot = annot.drop(index=[5734, 22334, 31816])
+
+        # Drop texts with 0 or 1 annotation only
+        annot = annot.drop(index=[851, 862, 3013, 3192, 3563, 3729, 5733, 12570,
+         12587, 13081, 13179, 13197, 13959, 22333, 31815, 33657, 34992])
+
+        # Drop text with CMP labels (189 texts)
+        annot = annot.drop(index=[
+        48,   427,   791,   995,  2754,  2965,  3074,  3303,  3433,
+        4071,  4705,  4883,  5422,  6038,  6603,  6812,  8245,  9036,
+       10063, 10701, 10995, 11824, 12800, 13126, 13187, 15580, 16057,
+       16077, 16331, 16824, 17492, 18133, 18744, 18989, 19072, 19810,
+       20015, 20105, 20182, 20200, 20216, 20363, 20413, 20663, 20838,
+       20845, 21232, 21330, 21577, 21601, 21668, 21794, 21869, 21945,
+       22040, 22211, 22454, 22489, 22500, 22850, 22934, 23301, 23329,
+       23423, 23445, 23490, 23499, 23544, 23738, 23749, 23888, 24474,
+       24501, 24827, 24850, 24879, 25037, 25038, 25039, 25040, 25041,
+       25042, 25043, 25044, 25045, 25046, 25047, 26371, 26429, 26570,
+       26675, 26693, 26720, 26783, 26844, 27558, 27698, 27742, 27751,
+       27842, 27872, 28019, 28020, 28021, 28022, 28023, 28024, 29189,
+       29232, 29318, 29558, 29833, 30245, 30252, 30371, 30491, 30509,
+       30773, 30935, 30938, 31009, 31288, 31737, 31875, 32094, 32195,
+       32211, 32289, 32355, 32371, 32648, 32736, 32779, 33106, 33291,
+       33423, 33501, 33839, 34025, 34072, 34095, 34224, 34390, 34441,
+       34478, 34793, 35047, 35111, 35180, 35192, 35250, 35464, 35588,
+       35894, 35956, 36069, 36276, 36370, 36512, 36580, 36678, 36812,
+       36958, 37089, 37186, 37203, 37460, 37487, 37638, 37730, 37828,
+       37857, 37861, 38042, 38147, 38195, 38329, 38527, 38602, 38658,
+       38687, 38692, 38741, 38879, 39144, 39819, 39830, 39926, 39943])
+
+        if expert_only:
+            annot = annot[["id", "text", "gold_label"]]
+            annot = annot.rename(columns={"gold_label": "label"})
+            annot = annot.replace({"label": {"HOM": "APR"}})
+
+            if binary:
+                label_mapping={'HOM': "non-derogatory", 'DEG': "derogatory", 'NDG': "non-derogatory", 'APR': "non-derogatory"}
+                annot = annot.replace({"label": label_mapping})
+            return annot
+
+        else:
+            annot = annot.drop(columns=["gold_label"])
+            annot_long = annot.melt(id_vars=["id", "text"], var_name="annotator", value_name="label").dropna().sort_values("id")
+            annot_long = annot_long[annot_long["label"] != "CMP"]
+            if binary:
+                label_mapping={'HOM': "non-derogatory", 'DEG': "derogatory", 'NDG': "non-derogatory", 'APR': "non-derogatory", 'CMP': 'non-derogatory'}
+                annot_long = annot_long.replace({"label": label_mapping})
+
+            if format == "wide":
+                annot_wide = annot_long.pivot(index=['id', "text"], columns='annotator', values='label').reset_index()
+                return annot_wide
+            elif format == "long":
+                return annot_long
+            else:
+                print(f"Format {format} is not available. Must be 'long' or 'wide'.")
+
+class EastAsianPrejudiceDataset():
+
+    def _get_text(self):
+        data_path = os.path.join(DATA_DIR, "east_asian_prejudice", "hs_AsianPrejudice_20kdataset_cleaned_anonymized.tsv")
+        annot = pd.read_table(data_path)
+
+        texts_df = annot[["id", "text.clean"]]
+        texts_df = texts_df.rename(columns={"text.clean": "text"})
+        return texts_df
+
+    def _get_expert_annotations(self, binary=False):
+        data_path = os.path.join(DATA_DIR, "east_asian_prejudice", "hs_AsianPrejudice_20kdataset_cleaned_anonymized.tsv")
+        annot = pd.read_table(data_path)
+
+        annot_data = annot[["id", "expert"]]
+        annot_data = annot_data.rename(columns={"expert": "label"})
+
+        # Change label from counter_speech to discussion_of_eastasian_prejudice
+        # as done in the original paper
+        annot_data.loc[annot_data['label'] == 'counter_speech', 'label'] = 'discussion_of_eastasian_prejudice'
+
+        if binary:
+            label_mapping={'discussion_of_eastasian_prejudice': "neutral", 'entity_directed_criticism': "neutral", 'entity_directed_hostility': "hostility", 'none_of_the_above': "neutral"}
+            annot_data = annot_data.replace({"label": label_mapping})
+
+        return annot_data
+
+    def _get_individual_annotations(self, format="long", binary=False):
+        data_path = os.path.join(DATA_DIR, "east_asian_prejudice", "hs_AsianPrejudice_40kdataset_cleaned_anonymized.tsv")
+        annot = pd.read_table(data_path)
+        annot["id"] = annot["id"].apply(lambda x: x.lower())
+        annot_data = annot[["id", "primary.actual", "annotator"]]
+        annot_data = annot_data.rename(columns={"primary.actual": "label"})
+
+        # Change label from counter_speech to discussion_of_eastasian_prejudice
+        # as done in the original paper
+        annot_data.loc[annot_data['label'] == 'counter_speech', 'label'] = 'discussion_of_eastasian_prejudice'
+
+        if binary:
+            label_mapping={'discussion_of_eastasian_prejudice': "neutral", 'entity_directed_criticism': "neutral", 'entity_directed_hostility': "hostility", 'none_of_the_above': "neutral"}
+            annot_data = annot_data.replace({"label": label_mapping})
+
+        if format == "long":
+            return annot_data
+        elif format == "wide":
+            annot_data = annot_data.pivot(index='id', columns='annotator', values='label').reset_index()
+            return annot_data
+        else:
+            print(f"Format {format} is not available. Must be 'long' or 'wide'. ")
+
+    def get_data(self, expert_only=False, format="long", binary=False):
+        """
+        If the data contains just one label. It returns a dataframe with columns ["text", "label"]
+        If the data contains labels by multiple annotators the dataframe can be returned in long or wide format.
+        In long format it has the columns ["text", "annotator", "label"]
+        In wide format it has the columns ["text", <annotator_ids...>]
+
+        """
+        texts_df = self._get_text()
+        if expert_only:
+            label_df = self._get_expert_annotations(binary=binary)
+        else:
+            label_df = self._get_individual_annotations(format=format, binary=binary)
+        data_df = pd.merge(texts_df, label_df, on="id")
+        data_df = data_df.set_index("id")
+        return data_df
+
+class WikipediaDataset():
+    # class drop_where...
+    def __init__(self, dataset):
+        self.dataset = dataset
+        self.comments, self.annotations = self._load_data()
+
+
+    def get_text(self, rev_ids=[]):
+        "ToDo get only specific rev_ids"
+        return self.comments[["rev_id", "comment"]]
+
+    def _load_data(self):
+        files = ["{}_annotated_comments.tsv", "{}_annotations.tsv", "{}_worker_demographics.tsv"]
+        complete_files = map(lambda filename: filename.format(self.dataset), files)
+        data_paths = [os.path.join(DATA_DIR, "raw", self.dataset, filename) for filename in complete_files]
+
+        comments_df = pd.read_table(data_paths[0])
+        annotations_df = pd.read_table(data_paths[1])
+        worker_demographics_df = pd.read_table(data_paths[2])
+
+        # Preprocess text comments
+        comments_df["comment"] = comments_df["comment"].apply(lambda comment: self._preprocess_comment(comment))
+
+        # Preprocess annotations and worker demographics
+        worker_demographics_df.loc[worker_demographics_df["english_first_language"]==1, "english_first_language"] = "native"
+        worker_demographics_df.loc[worker_demographics_df["english_first_language"]==0, "english_first_language"] = "non-native"
+
+        # Join annotations and worker demographics
+        annotations_df = pd.merge(annotations_df, worker_demographics_df, on="worker_id", how="left").fillna(
+            {"gender": "unknown", "english_first_language": "unknown", "age_group": "unknown", "education": "unknown"})
+
+        # Join text and annotations
+        annotations_df = pd.merge(annotations_df, comments_df, on="rev_id", how="left")
+        print('Loaded data')
+        return comments_df, annotations_df
+
+    def get_annotations(self, level="nominal", drop_where=[], rename_where=[], return_demographics=True, kind="df"):
+        annotations = self.annotations.copy()
+
+        annotations = self._drop_where(annotations, drop_where, rename_where)
+
+        if kind == "matrix":
+            return self._get_as_matrix(annotations, level)
+
+        elif kind == "df":
+            return self._get_as_df(annotations, return_demographics, level)
+
+        else:
+            print(f'Output {kind} not supported')
+
+
+    def get_annotations_by_demographic(self, demographic, level="nominal", drop_where=[], rename_where=[], min_count=1, return_demographics=True, kind="df"):
+        # Remove annotations
+        annotations = self.annotations.copy()
+        annotations = self._drop_where(annotations, drop_where, rename_where)
+
+        unique_dem_instances = annotations[demographic].unique()
+        print(f'Splitting by {demographic} with {len(unique_dem_instances)} unique values: {unique_dem_instances}')
+        # https://stackoverflow.com/questions/19790790/splitting-dataframe-into-multiple-dataframes?noredirect=1&lq=1
+        df_dict = dict(tuple(annotations.groupby(demographic)))
+
+        # Ensure that min_count per group is ensured for each comment
+        if min_count > 0:
+            eligible_comments = []
+            for key, df in df_dict.items():
+                grouped_series = df.groupby("rev_id").size()
+                grouped_series = grouped_series.where(grouped_series >= min_count).dropna()
+                eligible_comments.append(grouped_series)
+            eligible_comments = pd.concat(eligible_comments, axis=1, join="inner").index
+
+            for key, df in df_dict.items():
+                df_dict[key] = df[df["rev_id"].isin(eligible_comments)]
+
+        matrix_dict = {}
+
+        if kind == "matrix":
+            for instance in unique_dem_instances:
+                matrix_dict[instance] = self._get_as_matrix(df_dict[instance], level)
+            return unique_dem_instances, matrix_dict
+
+        elif kind == "df":
+            for instance in unique_dem_instances:
+                df_dict[instance] = self._get_as_df(df_dict[instance], return_demographics, level)
+            return unique_dem_instances, df_dict
+        else:
+            print(f'Output {kind} not supported')
+
+    def get_annotations_by_clusters(self, cluster_list, level="nominal", return_demographics=True, kind="df"):
+
+        out_dict = {}
+        for i, cluster in enumerate(cluster_list):
+            cluster_name = f'Cluster{i}'
+            df = self.annotations[self.annotations["worker_id"].isin(cluster)]
+            if kind == "matrix":
+                out_dict[f'Cluster{i}'] = self._get_as_matrix(df, level)
+                # TODO
+
+    def get_annotations_by_id(self, rev_ids=[], worker_ids=[], level="nominal", return_demographics=True, kind="df"):
+        annotations = self.annotations.copy()
+        if not rev_ids is None:
+            eligible_comments = annotations[annotations["rev_id"].isin(rev_ids)]
+
+        if kind == "matrix":
+            return self._get_as_matrix(eligible_comments, level)
+
+        elif kind == "df":
+            return self._get_as_df(eligible_comments, return_demographics, level)
+
+        else:
+            print(f'Output {kind} not supported')
+
+    def _drop_where(self,df, drop_where, rename_where):
+        """
+        Returns annotations where the column and value matches drop_where.
+        E.g. drop_where = [("gender", "male"), ("english_first_language", "non-native")]
+        df is the annotations dataframe
+        """
+        for (dem, value) in drop_where:
+            count_drop = df[df[dem] == value].count()["rev_id"]
+            df = df.loc[df[dem] != value, :]
+            print(f'Dropping {count_drop} annotations where the {dem} of the annotator is {value}')
+        df = df.copy()
+        for (dem, old_value, new_value) in rename_where:
+            count_rename = df[df[dem] == old_value].count()["rev_id"]
+
+            df.loc[df[dem] == old_value, dem] = new_value
+            print(f'Renaming {count_rename} {dem}s from {old_value} to {new_value}')
+        return df
+
+    def _get_as_matrix(self, df, level):
+        """
+        Pivots the provided dataframe from longform to wideform. The first column
+        is the rev_id and each following column a unique annotator.
+        """
+        if level == "nominal":
+            return df.pivot(index=["rev_id", "comment"], columns="worker_id", values=self.dataset).reset_index()
+        elif level == "ordinal":
+            return df.pivot(index=["rev_id", "comment"], columns="worker_id", values=f'{self.dataset}_score').reset_index()
+        else:
+            print(f'Level {level} not available')
+
+    def _get_as_df(self, df, return_demographics, level):
+        """
+        Returns either the full annotation dataframe with demographic information
+        for each annotation or a dataframe with just three columns: rev_id, worker_id, annotation
+        The level of the annotation is determined by the level argument.
+        """
+        df.index = df.index.astype(int)
+        if return_demographics:
+            return df
+        else:
+            if level == "nominal":
+                return df[["rev_id", "comment", "worker_id", self.dataset]].rename(columns={self.dataset: "annotation"})
+            elif level == "ordinal":
+                return df[["rev_id", "comment", "worker_id", f'{self.dataset}_score']].rename(columns={f'{self.dataset}_score': "annotation"})
+            else:
+                print(f'Level {level} not available')
+
+    def _preprocess_comment(self, comment):
+        """
+        """
+        comment = comment.replace("NEWLINE_TOKEN", " ")
+        comment = comment.replace("TAB_TOKEN", " ")
+        comment = comment.replace(":", "")
+        comment = comment.replace("=", "")
+        return comment
+
+
+class WikipediaVisualizer():
+    # Perform plotting on annotation, worker level
+    def plot_classes(self):
+        pass
+
+    def plot_demographics(self, annotations):
+        gender_count = df.gender.value_counts()
+        english_count = df.english_first_language.value_counts()
+        age_group_count = df.age_group.value_counts()
+        education_count = df.education.value_counts()
+
+        fig, (ax1, ax2, ax3, ax4) = plt.subplots(nrows=1, ncols=4, sharey=True)
+        gender_count.plot(kind="bar", ax=ax1, title="Gender")
+        english_count.plot(kind="bar", ax=ax2, title= "English native")
+        age_group_count.plot(kind="bar", ax=ax3, title = "Age group")
+        education_count.plot(kind="bar", ax=ax4, title = "Education")
+        fig.suptitle("Demographics of {} annotators".format(dataset, level))
+        return fig
+
+
+
+
+
+def load_data(dataset):
+    """
+
+    """
+    DATA_DIR = "../data"
+    files = ["{}_annotated_comments.tsv", "{}_annotations.tsv", "{}_worker_demographics.tsv"]
+    complete_files = map(lambda filename: filename.format(dataset), files)
+    data_paths = [os.path.join(DATA_DIR, "raw", dataset, filename) for filename in complete_files]
+
+    comments_df = pd.read_table(data_paths[0])
+    annotations_df = pd.read_table(data_paths[1])
+    worker_demographics_df = pd.read_table(data_paths[2])
+
+    # Preprocess text comments
+    comments_df["comment"] = comments_df["comment"].apply(lambda comment: preprocess_comment(comment))
+
+    # Preprocess annotations and worker demographics
+    worker_demographics_df.loc[worker_demographics_df["english_first_language"]==1, "english_first_language"] = "native"
+    worker_demographics_df.loc[worker_demographics_df["english_first_language"]==0, "english_first_language"] = "non_native"
+
+    # Join annotations and worker demographics
+    annotations_df = pd.merge(annotations_df, worker_demographics_df, on="worker_id", how="left").fillna(
+        {"gender": "unknown", "english_first_language": "unknown", "age_group": "unknown", "education": "unknown"})
+
+    return comments_df, annotations_df
+
+def _check_min_count(row, min_count):
+    counts = row.values
+    valid_counts = counts >= min_count
+    return all(valid_counts)
+
+def limit_dataset(annotations_df, dataset, demographic, min_count=3, drop_unknown=False):
+    if drop_unknown:
+        count_unknown = annotations_df[annotations_df[demographic] == "unknown"].count()["rev_id"]
+        annotations_df = annotations_df[annotations_df[demographic] != "unknown"]
+        print(f'Dropping {count_unknown} annotations where {demographic} is unknown')
+
+    # Taken from Hala
+    annotator_counts_df = annotations_df.groupby(["rev_id", demographic])["worker_id"].count().reset_index(name="count").pivot("rev_id", demographic, "count").fillna(0)
+    annotator_counts_df["min_count_fulfilled"] = annotator_counts_df.apply(lambda row: _check_min_count(row, min_count), axis=1)
+    valid_ids_df = annotator_counts_df[annotator_counts_df["min_count_fulfilled"] == True].index
+    valid_annotations_df = annotations_df[annotations_df["rev_id"].isin(valid_ids_df)]
+    print(f"{len(valid_ids_df)} comments with at least {min_count} annotations by {valid_annotations_df[demographic].unique()} remain.")
+    return valid_annotations_df
+
+
+def get_majority_annotations(all_annotations_df, selected_annotations_df, dataset, ordinal=False):
+    annotations_df = all_annotations_df[all_annotations_df["rev_id"].isin(selected_annotations_df["rev_id"])]
+    if ordinal:
+        assert(dataset in ["aggression", "toxicity"])
+        mj_annotations = annotations_df.groupby(["rev_id"]).agg(mj_annotation_score=pd.NamedAgg(column=f'{dataset}_score', aggfunc=lambda x: statistics.mode(x)))
+    else:
+        mj_annotations = annotations_df.groupby(["rev_id"]).agg(mj_annotation=pd.NamedAgg(column=dataset, aggfunc=lambda x: statistics.mode(x)))
+    return mj_annotations.values
+
+
+def group_annotations_by_demographics(annotations_df, dataset, demographic):
+    """
+    drop_unkown: If True the annotations of an annotator that has unknown at the specified characterstic is droped.
+    """
+    assert(dataset in ["attack", "aggression", "toxicity"])
+    unique_dem_instances = annotations_df[demographic].unique()
+    print(f'Splitting by {demographic} with {len(unique_dem_instances)} unique values: {unique_dem_instances}')
+
+    if dataset in ["aggression", "toxicity"]:
+        agg_annotations = annotations_df.groupby(["rev_id", demographic]).agg(annotation_list=pd.NamedAgg(column=dataset, aggfunc=list),
+                                                                              annotation_score_list=pd.NamedAgg(column=f'{dataset}_score', aggfunc=list),
+                                                                              worker_id_list=pd.NamedAgg(column="worker_id", aggfunc=list))
+    else:
+        agg_annotations = annotations_df.groupby(["rev_id", demographic]).agg(annotation_list=pd.NamedAgg(column=dataset, aggfunc=list),
+                                                                              worker_id_list=pd.NamedAgg(column="worker_id", aggfunc=list))
+
+    #agg_annotations =  agg_annotations.merge(gt_annotations, left_index=True, right_index=True, how="left")
+    agg_annotations = agg_annotations.reset_index()
+    agg_annotations = agg_annotations.rename(columns={dataset: 'annotator'})
+    #agg_annotations["num_annotations"] =  agg_annotations["annotation_list"].apply(len)
+    return agg_annotations
+
+def get_annotations_as_matrix(annotations, dataset, ordinal=False):
+    if ordinal:
+        assert(dataset in ["aggression", "toxicity"])
+        return annotations.pivot(index="rev_id", columns="worker_id", values=f'{dataset}_score')
+    else:
+        return annotations.pivot(index="rev_id", columns="worker_id", values=dataset)
+
+
+def aggregate_annotations(split_annotations_df, demographic, ordinal):
+    if ordinal:
+        split_annotations_df["annotation_score"] = split_annotations_df["annotation_score_list"].apply(lambda x: statistics.mode(x))
+        agg_annotations_df = split_annotations_df[["rev_id", demographic, "annotation_score"]]
+    else:
+        split_annotations_df["annotation"] = split_annotations_df["annotation_list"].apply(lambda x: statistics.mode(x))
+        agg_annotations_df = split_annotations_df[["rev_id", demographic, "annotation"]]
+    return agg_annotations_df
+
+def prepare_dawid_skene(agg_annotations_df):
+    data = {}
+    data_split = agg_annotations_df.to_dict('split')['data']
+    for data_point in data_split:
+        question = data_point[0]
+        annotator = data_point[1]
+        annotation = data_point[2]
+        if question not in data:
+            data[question] = {}
+        if annotator not in data[question]:
+            data[question][annotator] = []
+        data[question][annotator].append(annotation)
+    return data
+
+def plot_error_matrices(error_rates, observers, classes, class_marginals):
+
+    for i, obs in enumerate(observers):
+        error_rate = error_rates[i]
+        incidence_of_error_rate = class_marginals * error_rate
+
+        f, axs = plt.subplots(1, 2)
+        sns.heatmap(error_rate, vmin=0, vmax=1, annot=True, cbar=False, ax=axs[0])
+        axs[0].set_title(f'Error rate \n {obs}')
+        axs[0].set_xlabel('Observed label')
+        axs[0].set_ylabel('Latent truth')
+        axs[0].set_xticklabels(classes)
+        axs[0].set_yticklabels(classes)
+
+        sns.heatmap(incidence_of_error_rate, vmin=0, vmax=1, annot=True, cbar=False, ax=axs[1])
+        axs[1].set_title(f'Incidence-of-error probabilities \n {obs}')
+        axs[1].set_xlabel('Observed label')
+        axs[1].set_ylabel('Latent truth')
+        axs[1].set_xticklabels(classes)
+        axs[1].set_yticklabels(classes)
+        f.tight_layout()
+    return f
+
+
+def evaluate_DS(latent_truth, mj_annotation):
+    print(f"Accuracy: {accuracy_score(latent_truth, mj_annotation)}")
+    conf_matrix = confusion_matrix(latent_truth, mj_annotation)
+    fig = sns.heatmap(conf_matrix, vmin=0, vmax=1, annot=True, cbar=False, ax=axs[0])
+    fig.set_title(f'Confusion matrix')
+    fig.set_xlabel('Observed label')
+    fig.set_ylabel('Latent truth')
+
+if __name__ == '__main__':
+    pass
